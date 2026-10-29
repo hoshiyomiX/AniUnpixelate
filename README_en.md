@@ -28,7 +28,7 @@
 - **Platform**: Android
 - **Language**: Java / Kotlin
 - **AI Engine**: ONNX Runtime
-- **Model Architecture**: Anime-specific restoration model (256x256 input) based on GAN or Residual Networks.
+- **Model Architecture**: big-lama (SAIC AI, Apache-2.0) ONNX export (512×512 input, image+mask dual input, FFC global context)
 
 ## 📦 Building the APK
 
@@ -42,15 +42,16 @@
 ### Option B: Local build
 
 ```bash
-# 1. Place the model file into the assets folder
-#    (the model is not committed for licensing reasons):
-#    app/src/main/assets/model.onnx
+# 1. Download the model (Apache-2.0, big-lama ONNX export, 208 MB)
+#    from https://huggingface.co/gumka/lama-onnx
+#    and place it at app/src/main/assets/model.onnx
+#    (that path is excluded by .gitignore)
 # 2. Build
 ./gradlew assembleDebug
 # Output: app/build/outputs/apk/debug/
 ```
 
-> Note: `model.onnx` is intentionally not part of the repository (see `.gitignore`). The APK still builds and installs without it, but restoration will show a "model missing" message. The release APK is unsigned — sign it with `apksigner` before distribution.
+> Note: the model is not committed to the repo (see `.gitignore`); CI fetches it automatically from Hugging Face and verifies its SHA256 (see the workflow file). The model is a **big-lama** (SAIC AI, Apache-2.0) ONNX export: input 1×3×512×512 ([0,1]) + mask 1×1×512×512 (1 = restore zone), output returns at 255 scale. Without the model the APK still builds and installs, but restoration shows a "model missing" message. The release APK is unsigned — sign it with `apksigner` before distribution.
 
 
 ## ⚠️ Legal & Disclaimer

@@ -28,7 +28,7 @@
 - **平台**：Android
 - **开发语言**：Java / Kotlin
 - **AI 引擎**：ONNX Runtime
-- **模型架构**：基于 GAN 或残差网络的动漫专用修复模型 (256x256 输入尺寸)
+- **模型架构**：big-lama（SAIC AI，Apache-2.0）ONNX 导出 (512×512 输入，image+mask 双输入，FFC 全局上下文)
 
 ## 📦 构建 APK
 
@@ -42,14 +42,15 @@
 ### 方式二：本地构建
 
 ```bash
-# 1. 将模型文件放入 assets 目录（模型因授权原因不入库）
-#    app/src/main/assets/model.onnx
+# 1. 下载模型（Apache-2.0，big-lama ONNX 导出，208 MB）
+#    与 CI 使用同一文件：https://huggingface.co/gumka/lama-onnx
+#    放入 app/src/main/assets/model.onnx（该路径已被 .gitignore 排除）
 # 2. 构建
 ./gradlew assembleDebug
 # 产物位于 app/build/outputs/apk/debug/
 ```
 
-> 注意：仓库默认不包含 `model.onnx`（见 `.gitignore`）。缺少模型时 APK 仍可构建安装，但修复功能会提示模型缺失。release APK 未签名，分发前请自行签名（`apksigner`）。
+> 注意：模型不在仓库中（见 `.gitignore`），CI 构建时会自动从 Hugging Face 拉取并校验 SHA256（见工作流文件）。模型为 **big-lama**（SAIC AI，Apache-2.0）的 ONNX 导出，输入 1×3×512×512（[0,1]）+ 掩码 1×1×512×512（1=修复区），输出按 255 尺度回归 [0,1]。缺少模型时 APK 仍可构建安装，但修复功能会提示模型缺失。release APK 未签名，分发前请自行签名（`apksigner`）。
 
 
 ## ⚠️ 法律与免责声明

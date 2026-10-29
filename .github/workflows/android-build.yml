@@ -29,6 +29,18 @@ jobs:
       - name: Set up Gradle with caching
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Fetch ONNX model (Apache-2.0, big-lama)
+        # The model is fetched at build time instead of living in git (208 MB
+        # binary). Pinned URL + SHA256; swap the pin to upgrade the model.
+        env:
+          MODEL_URL: https://huggingface.co/gumka/lama-onnx/resolve/main/lama_fp32.onnx
+          MODEL_SHA256: 1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fsSL --retry 3 -o app/src/main/assets/model.onnx "$MODEL_URL"
+          echo "$MODEL_SHA256  app/src/main/assets/model.onnx" | sha256sum -c -
+          ls -la app/src/main/assets/model.onnx
+
       - name: Check for bundled ONNX model
         run: |
           if [ ! -f app/src/main/assets/model.onnx ]; then

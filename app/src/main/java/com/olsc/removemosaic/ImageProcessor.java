@@ -32,25 +32,29 @@ import ai.onnxruntime.OrtSession;
  *
  * Pipeline: compute the bounding box of all selections (plus padding so the
  * network sees surrounding context) -> expand it to a SQUARE context window
- * (stretching a non-square crop to the 256x256 input used to distort the
+ * (stretching a non-square crop to the model's square input used to distort the
  * geometry the model perceives and blur the result) -> progressively halve
  * the region down to the working resolution (single-step bilinear skips
  * source pixels when minifying more than ~2x and shimmers line art) -> run
- * inference -> extract exactly the crop's sub-rect from the 256x256 output
+ * inference -> extract exactly the crop's sub-rect from the model-resolution output
  * -> scale it back -> sharpen it (unsharp mask; the model regresses to the
  * mean so its output is systematically soft) -> alpha-blend it into the
  * original through a feathered selection mask.
  */
 public class ImageProcessor {
 
-    private static final int MODEL_INPUT_SIZE = 256;
+    /**
+     * Fixed input side required by the bundled ONNX model (big-lama ONNX
+     * export: 1x3x512x512 float [0,1] "image" + 1x1x512x512 {0,1} "mask",
+     * 1 marks the restore zone; output arrives at 255 scale).
+     */
+    private static final int MODEL_INPUT_SIZE = 512;
     private static final int CROP_PADDING = 32;
 
     /**
      * Side of the intermediate square canvas the model input is composed on.
-     * Kept at 2x the model resolution so every resampling step in the chain
-     * (halving -> compose -> final downscale) stays inside the ~2x window
-     * where bilinear filtering is artifact-free.
+     * Equal to the model resolution, so the compose step feeds the network
+     * 1:1 with no additional lossy resampling in between.
      */
     private static final int WORK_SIZE = 512;
 
@@ -155,7 +159,7 @@ public class ImageProcessor {
         final int cropH = maxY - minY;
 
         // ------------------------------------------------------------------
-        // Square context window. The model input is square (256x256); feeding
+        // Square context window. The model input is square; feeding
         // it a stretched non-square crop makes it reconstruct distorted
         // geometry, which reads as blur and warping after scaling back. The
         // window is centered on the crop, shifted to stay inside the image,
@@ -217,11 +221,14 @@ public class ImageProcessor {
         }
         maskCanvas.restore();
 
-        // Final step down to the model's resolution (exactly 2x, safe).
-        final Bitmap modelImg = Bitmap.createScaledBitmap(squareWork,
-                MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, true);
-        final Bitmap modelMask = Bitmap.createScaledBitmap(maskWork,
-                MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, true);
+        // Final step to the model's resolution (1:1 when WORK_SIZE equals
+        // MODEL_INPUT_SIZE; createScaledBitmap would still copy, so skip it).
+        final Bitmap modelImg = (squareWork.getWidth() == MODEL_INPUT_SIZE)
+                ? squareWork
+                : Bitmap.createScaledBitmap(squareWork, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, true);
+        final Bitmap modelMask = (maskWork.getWidth() == MODEL_INPUT_SIZE)
+                ? maskWork
+                : Bitmap.createScaledBitmap(maskWork, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, true);
 
         // Prepare tensor data (NCHW float, values normalized to [0, 1]).
         final int pixelCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
@@ -266,9 +273,12 @@ public class ImageProcessor {
                 for (int i = 0; i < pixelCount; i++) {
                     int row = i / MODEL_INPUT_SIZE;
                     int col = i % MODEL_INPUT_SIZE;
-                    float rf = outputArr[0][0][row][col];
-                    float gf = outputArr[0][1][row][col];
-                    float bf = outputArr[0][2][row][col];
+                    // The bundled big-lama ONNX export emits its output at 255
+                    // scale (0-255 floats) even though the input is [0,1];
+                    // normalize back before the 0-255 pixel quantization below.
+                    float rf = outputArr[0][0][row][col] / 255.0f;
+                    float gf = outputArr[0][1][row][col] / 255.0f;
+                    float bf = outputArr[0][2][row][col] / 255.0f;
                     // Guard against non-finite values some models emit:
                     // NaN would otherwise become a black pixel.
                     if (Float.isNaN(rf)) rf = Color.red(pixelsImg[i]) / 255.0f;
@@ -287,7 +297,7 @@ public class ImageProcessor {
         }
 
         // ------------------------------------------------------------------
-        // Cut the crop's sub-rect out of the 256x256 output. Because the
+        // Cut the crop's sub-rect out of the model-resolution output. Because the
         // square mapping is uniform, the sub-rect has the crop's aspect
         // ratio — scaling it back to cropW x cropH involves no distortion.
         // ------------------------------------------------------------------
@@ -335,7 +345,7 @@ public class ImageProcessor {
 
         // ------------------------------------------------------------------
         // Unsharp mask on the restored pixels, at the FINAL resolution so it
-        // puts back the acutance the 256px model ceiling and the bilinear
+        // puts back the acutance the model-resolution ceiling and the bilinear
         // upscale took away. Runs channel-by-channel to keep the memory
         // footprint at a single extra int[] regardless of crop size.
         // ------------------------------------------------------------------
