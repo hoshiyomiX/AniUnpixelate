@@ -23,6 +23,7 @@ import java.util.Map;
 
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
+import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
 
 /**
@@ -90,7 +91,12 @@ public class ImageProcessor {
     /** Releases the native ONNX session. Safe to call multiple times. */
     public synchronized void close() {
         if (session != null) {
-            session.close();
+            try {
+                session.close();
+            } catch (OrtException e) {
+                // Native release failed; dropping the reference is still the
+                // best we can do from a cleanup path.
+            }
             session = null;
         }
     }
