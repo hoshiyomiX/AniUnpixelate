@@ -49,11 +49,23 @@ public class MosaicView extends View {
         fillPaint.setStyle(Paint.Style.FILL);
         fillPaint.setAlpha(60);
 
-        // 设置双指缩放监听器
+        // Pinch-zoom listener with sane zoom limits (0.2x - 20x of the
+        // fit-to-screen scale) so the matrix can never degenerate to zero
+        // or explode to infinity.
         scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
                 float scaleFactor = detector.getScaleFactor();
+                float[] vals = new float[9];
+                float[] baseVals = new float[9];
+                drawMatrix.getValues(vals);
+                baseMatrix.getValues(baseVals);
+                float currentScale = Math.abs(vals[Matrix.MSCALE_X]);
+                float baseScale = Math.max(0.0001f, Math.abs(baseVals[Matrix.MSCALE_X]));
+                float nextScale = currentScale * scaleFactor;
+                if (nextScale < baseScale * 0.2f || nextScale > baseScale * 20f) {
+                    return true; // out of range: ignore this delta
+                }
                 drawMatrix.postScale(scaleFactor, scaleFactor, detector.getFocusX(), detector.getFocusY());
                 invalidate();
                 return true;
@@ -68,6 +80,17 @@ public class MosaicView extends View {
         this.image = bitmap;
         rectangles.clear();
         calculateInitialMatrix();
+        invalidate();
+    }
+
+    /**
+     * Restores a previously saved selection list (e.g. after rotation).
+     */
+    public void restoreRectangles(List<RectF> saved) {
+        rectangles.clear();
+        if (saved != null) {
+            rectangles.addAll(saved);
+        }
         invalidate();
     }
 
@@ -157,26 +180,26 @@ public class MosaicView extends View {
             return true;
         }
 
-        // 单指逻辑：处理绘图
-        if (event.getAction() == MotionEvent.ACTION_DOWN) {
+        // Single-pointer logic: drawing.
+        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
             isTransforming = false;
         }
 
         if (isTransforming) {
-            if (event.getAction() == MotionEvent.ACTION_UP) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP) {
                 isTransforming = false;
             }
             return true;
         }
 
-        // 将触模点从屏幕坐标转换为图片坐标
+        // Map the touch point from screen coordinates to image coordinates.
         drawMatrix.invert(inverseMatrix);
         float[] pts = new float[]{event.getX(), event.getY()};
         inverseMatrix.mapPoints(pts);
         float x = pts[0];
         float y = pts[1];
 
-        switch (event.getAction()) {
+        switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 startX = x;
                 startY = y;
@@ -193,13 +216,21 @@ public class MosaicView extends View {
                 if (currentRect != null) {
                     currentRect.set(Math.min(startX, x), Math.min(startY, y),
                             Math.max(startX, x), Math.max(startY, y));
-                    // 只有面积足够大的矩形才被保存
+                    // Only rectangles with a reasonable area are kept.
                     if (currentRect.width() > 5 && currentRect.height() > 5) {
                         rectangles.add(new RectF(currentRect));
                     }
                     currentRect = null;
                     invalidate();
                 }
+                performClick();
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                // Gesture aborted by the system: drop the in-flight rectangle
+                // and leave the transform state consistent.
+                currentRect = null;
+                isTransforming = false;
+                invalidate();
                 break;
         }
         return true;

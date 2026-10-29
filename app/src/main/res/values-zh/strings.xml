@@ -12,8 +12,11 @@
     <string name="status_complete">修复完成</string>
     <string name="btn_refine_area">调整区域</string>
     <string name="btn_action_unpixelate">开始修复</string>
+    <string name="label_sharpen">锐化强度</string>
     <string name="error_load_image">图像加载失败</string>
+    <string name="error_decode_image">无法解码该图片，文件可能已损坏或格式不受支持。</string>
     <string name="error_model_fail">模型加载失败</string>
+    <string name="error_model_missing">当前安装包未内置 AI 模型文件 (model.onnx)。请先将其放入 app/src/main/assets/ 并重新打包。</string>
     <string name="msg_select_area">请先选择需要修复的区域</string>
     <string name="status_loading_weights">正在加载神经元权重…</string>
     <string name="status_performing_magic">正在施展 AI 修复魔法…</string>
@@ -25,5 +28,5 @@
     <string name="disclaimer_title">隐私说明与免责声明</string>
     <string name="disclaimer_content">本项目旨在探索图像加密解密在深度学习领域的潜在问题，以及在网络传播、安全领域的运用。\n\n【严禁违法】严禁将本项目用于任何违法违规用途，否则后果自负，开发者不承担任何法律责任。\n\n【技术限制】为防止技术滥用，本示例版本仅支持对二次元/动漫类型的图像进行修复演示。</string>
     <string name="btn_agree">同意并继续</string>
-    <string name="btn_exit">退出应用合</string>
+    <string name="btn_exit">退出应用</string>
 </resources>

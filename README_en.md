@@ -30,6 +30,29 @@
 - **AI Engine**: ONNX Runtime
 - **Model Architecture**: Anime-specific restoration model (256x256 input) based on GAN or Residual Networks.
 
+## 📦 Building the APK
+
+### Option A: GitHub Actions (recommended — no local setup)
+
+1. Fork or push this repository to your GitHub account.
+2. Open the **Actions** tab — the `Build APK` workflow runs automatically on every push / PR.
+3. When the run finishes, download `AniRestore-APK` from the run's **Artifacts** section (contains debug and unsigned release APKs).
+4. (Optional) Push a tag like `v1.0` and the workflow will automatically create a GitHub Release with the APKs attached.
+
+### Option B: Local build
+
+```bash
+# 1. Place the model file into the assets folder
+#    (the model is not committed for licensing reasons):
+#    app/src/main/assets/model.onnx
+# 2. Build
+./gradlew assembleDebug
+# Output: app/build/outputs/apk/debug/
+```
+
+> Note: `model.onnx` is intentionally not part of the repository (see `.gitignore`). The APK still builds and installs without it, but restoration will show a "model missing" message. The release APK is unsigned — sign it with `apksigner` before distribution.
+
+
 ## ⚠️ Legal & Disclaimer
 
 This project is intended for academic research on deep learning applications in image processing.

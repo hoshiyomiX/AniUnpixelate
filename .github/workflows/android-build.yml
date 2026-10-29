@@ -1,0 +1,65 @@
+name: Build APK
+
+# Builds the Android APK on every push and pull request.
+# Debug APK  -> installable directly.
+# Release APK -> unsigned; sign it before distribution (see README).
+# Tag pushes (v*) additionally publish both APKs to a GitHub Release.
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build debug & release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle with caching
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Check for bundled ONNX model
+        run: |
+          if [ ! -f app/src/main/assets/model.onnx ]; then
+            echo "::warning::model.onnx not found in app/src/main/assets/ — the APK will build, but AI restoration will not work until the model file is bundled."
+          else
+            echo "model.onnx found — it will be packaged into the APK."
+          fi
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Build release APK (unsigned)
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AniRestore-APK
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" --title "$TAG" --generate-notes || true
+          gh release upload "$TAG" \
+            app/build/outputs/apk/debug/*.apk \
+            app/build/outputs/apk/release/*.apk \
+            --clobber

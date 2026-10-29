@@ -36,6 +36,7 @@ dependencies {
     implementation libs.appcompat
     implementation libs.material
     implementation libs.onnxruntime
+    implementation libs.exifinterface
     implementation 'com.github.chrisbanes:PhotoView:2.3.0'
     testImplementation libs.junit
     androidTestImplementation libs.ext.junit

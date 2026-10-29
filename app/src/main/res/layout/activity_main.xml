@@ -211,6 +211,50 @@
                 </LinearLayout>
             </FrameLayout>
 
+            <!-- Sharpening strength control: feeds the post-restoration
+                 unsharp mask. Runs again on the next "Unpixelate" tap. -->
+            <androidx.cardview.widget.CardView
+                android:id="@+id/sharpen_card"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:layout_gravity="bottom|center_horizontal"
+                android:layout_marginBottom="108dp"
+                app:cardCornerRadius="24dp"
+                app:cardElevation="4dp"
+                app:cardBackgroundColor="@color/white">
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="match_parent"
+                    android:orientation="horizontal"
+                    android:gravity="center"
+                    android:paddingHorizontal="16dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/label_sharpen"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp" />
+
+                    <SeekBar
+                        android:id="@+id/seek_sharpen"
+                        android:layout_width="160dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginHorizontal="10dp"
+                        android:max="100"
+                        android:progress="60" />
+
+                    <TextView
+                        android:id="@+id/txt_sharpen_value"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="60%"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp" />
+                </LinearLayout>
+            </androidx.cardview.widget.CardView>
+
             <!-- Result Control Bar -->
             <androidx.cardview.widget.CardView
                 android:id="@+id/result_controls"

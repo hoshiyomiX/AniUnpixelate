@@ -30,6 +30,28 @@
 - **AI 引擎**：ONNX Runtime
 - **模型架构**：基于 GAN 或残差网络的动漫专用修复模型 (256x256 输入尺寸)
 
+## 📦 构建 APK
+
+### 方式一：GitHub Actions（推荐，无需本地环境）
+
+1. Fork 或推送本仓库到你的 GitHub 账号。
+2. 进入仓库 **Actions** 页签，工作流 `Build APK` 会在每次 push / PR 时自动构建。
+3. 构建完成后，在该次运行页面底部的 **Artifacts** 区域下载 `AniRestore-APK`（含 debug 与 unsigned release 两个 APK）。
+4. （可选）推送形如 `v1.0` 的 Tag，工作流会自动创建 GitHub Release 并附上 APK。
+
+### 方式二：本地构建
+
+```bash
+# 1. 将模型文件放入 assets 目录（模型因授权原因不入库）
+#    app/src/main/assets/model.onnx
+# 2. 构建
+./gradlew assembleDebug
+# 产物位于 app/build/outputs/apk/debug/
+```
+
+> 注意：仓库默认不包含 `model.onnx`（见 `.gitignore`）。缺少模型时 APK 仍可构建安装，但修复功能会提示模型缺失。release APK 未签名，分发前请自行签名（`apksigner`）。
+
+
 ## ⚠️ 法律与免责声明
 
 本项旨在探索深度学习在图像处理领域的学术研究。
