@@ -11,10 +11,13 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 
-import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -51,6 +54,13 @@ public class ImageProcessor {
     private static final int MODEL_INPUT_SIZE = 512;
     private static final int CROP_PADDING = 32;
 
+    /** Asset name of the packaged ONNX model; also the extracted file name. */
+    private static final String MODEL_ASSET = "model.onnx";
+    /** Chunk size for asset extraction; small on purpose, never heap-sized. */
+    private static final int COPY_BUFFER = 64 * 1024;
+    /** Free internal storage required before extracting the ~200 MB model. */
+    private static final long MIN_FREE_FOR_EXTRACT = 220L * 1024 * 1024;
+
     /**
      * Side of the intermediate square canvas the model input is composed on.
      * Equal to the model resolution, so the compose step feeds the network
@@ -64,31 +74,146 @@ public class ImageProcessor {
     private OrtSession session;
     private final OrtEnvironment env = OrtEnvironment.getEnvironment();
 
-    /** Loads the ONNX model from the app assets. Idempotent and thread-safe. */
+    /**
+     * Loads the ONNX model for inference.
+     *
+     * The packaged asset (about 200 MB for big-lama) is streamed out of the
+     * APK to filesDir with a small fixed buffer and the session is created
+     * from the resulting FILE PATH. The model is never buffered in the Java
+     * heap: holding a 200+ MB model in a byte[] needs a heap several times
+     * the file size (ByteArrayOutputStream doubling plus the toByteArray
+     * copy), which is impossible on devices with a 256 MB heap cap — it died
+     * with OutOfMemoryError in the field. ORT keeps the model in native
+     * memory instead, which is not subject to the Java heap limit.
+     *
+     * The extracted copy is stamped with the package's lastUpdateTime, so an
+     * app update always re-extracts (a model swap must never serve a stale
+     * file) while a normal launch reuses the copy at zero cost. Extraction
+     * is crash-safe: write to a temp file, fsync, rename; the stamp is only
+     * written after the target file is complete.
+     *
+     * Idempotent and thread-safe.
+     */
     public synchronized void loadModel(Context context) throws IOException {
         if (session != null) return;
 
-        byte[] modelBytes;
-        try (InputStream is = context.getAssets().open("model.onnx")) {
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 20);
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) {
-                bos.write(buf, 0, n);
+        final File dir = context.getFilesDir();
+        final File target = new File(dir, MODEL_ASSET);
+        final File stamp = new File(dir, MODEL_ASSET + ".stamp");
+
+        // Self-healing: if a previously extracted copy fails to produce a
+        // working session (corrupt file), purge it and retry once with a
+        // fresh extraction instead of failing on a bad cache forever.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            final boolean fresh = ensureModelExtracted(context, dir, target, stamp);
+            try (OrtSession.SessionOptions options = new OrtSession.SessionOptions()) {
+                session = env.createSession(target.getAbsolutePath(), options);
+                return;
+            } catch (Exception e) {
+                if (fresh || attempt == 1) {
+                    // Wrap and preserve the root cause instead of swallowing it.
+                    throw new IOException("Failed to create ONNX session: "
+                            + e.getMessage(), e);
+                }
             }
-            modelBytes = bos.toByteArray();
-        } catch (FileNotFoundException e) {
-            throw new FileNotFoundException("model.onnx is missing from app assets");
         }
-        if (modelBytes.length == 0) {
-            throw new IOException("model.onnx is empty");
+    }
+
+    /**
+     * Makes sure {@code target} holds the packaged model asset. Returns true
+     * when this call extracted it, false when an existing stamped copy from
+     * the current install was reused. Throws FileNotFoundException when the
+     * APK ships no model at all.
+     */
+    private static boolean ensureModelExtracted(Context context, File dir,
+                                                 File target, File stamp)
+            throws IOException {
+        final String expect = installStamp(context);
+        boolean cached = false;
+        try {
+            cached = target.isFile() && target.length() > 0
+                    && stamp.isFile() && expect.equals(readStampFile(stamp));
+        } catch (IOException unreadableStamp) {
+            cached = false; // unreadable stamp == not stamped -> re-extract
+        }
+        if (cached) return false;
+
+        // The model is roughly 200 MB on disk; fail fast with a clear
+        // message instead of filling the flash halfway into a copy.
+        if (dir.getUsableSpace() < MIN_FREE_FOR_EXTRACT) {
+            throw new IOException("Not enough free storage to extract the AI model "
+                    + "(about " + (MIN_FREE_FOR_EXTRACT / (1024 * 1024)) + " MB needed)");
         }
 
-        try (OrtSession.SessionOptions options = new OrtSession.SessionOptions()) {
-            session = env.createSession(modelBytes, options);
+        final File tmp = new File(dir, MODEL_ASSET + ".tmp");
+        try {
+            streamAssetToFile(context, MODEL_ASSET, tmp);
+            if (tmp.length() == 0) {
+                throw new IOException("model.onnx is empty");
+            }
+            if (!tmp.renameTo(target)) {
+                throw new IOException("Failed to move the extracted model into place");
+            }
+            writeStampFile(stamp, expect);
+        } catch (FileNotFoundException e) {
+            throw new FileNotFoundException("model.onnx is missing from app assets");
+        } finally {
+            // No-op after a successful rename; cleans up the half-written
+            // temp file when the copy failed midway.
+            tmp.delete();
+        }
+        return true;
+    }
+
+    /** Copies an asset to a file with a small fixed buffer (never heap-sized). */
+    private static void streamAssetToFile(Context context, String asset, File out)
+            throws IOException {
+        final byte[] buf = new byte[COPY_BUFFER];
+        try (InputStream is = context.getAssets().open(asset);
+             FileOutputStream fos = new FileOutputStream(out, false)) {
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                fos.write(buf, 0, n);
+            }
+            fos.flush();
+            fos.getFD().sync();
+        }
+    }
+
+    /** Package update stamp; changes on every install or update of the APK. */
+    private static String installStamp(Context context) {
+        try {
+            final android.content.pm.PackageManager pm = context.getPackageManager();
+            final long t;
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                t = pm.getPackageInfo(context.getPackageName(),
+                        android.content.pm.PackageManager.PackageInfoFlags.of(0)).lastUpdateTime;
+            } else {
+                t = pm.getPackageInfo(context.getPackageName(), 0).lastUpdateTime;
+            }
+            return Long.toString(t);
         } catch (Exception e) {
-            // Wrap and preserve the root cause instead of swallowing it.
-            throw new IOException("Failed to create ONNX session: " + e.getMessage(), e);
+            return "unknown"; // fall back to always-extract behaviour
+        }
+    }
+
+    private static String readStampFile(File f) throws IOException {
+        try (FileInputStream in = new FileInputStream(f)) {
+            final StringBuilder sb = new StringBuilder(32);
+            final byte[] b = new byte[32];
+            int n;
+            while ((n = in.read(b)) > 0) {
+                sb.append(new String(b, 0, n, StandardCharsets.US_ASCII));
+            }
+            return sb.toString().trim();
+        }
+    }
+
+    private static void writeStampFile(File f, String value) throws IOException {
+        try (FileOutputStream out = new FileOutputStream(f, false)) {
+            out.write(value.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            out.getFD().sync();
         }
     }
 

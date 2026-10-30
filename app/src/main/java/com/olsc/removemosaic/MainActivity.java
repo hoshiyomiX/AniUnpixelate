@@ -328,7 +328,7 @@ public class MainActivity extends AppCompatActivity {
 
         worker.execute(() -> {
             Bitmap result = null;
-            Exception failure = null;
+            Throwable failure = null;
             try {
                 runOnUiThread(() ->
                         txtLoadingStatus.setText(getString(R.string.status_loading_weights)));
@@ -337,12 +337,14 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() ->
                         txtLoadingStatus.setText(getString(R.string.status_performing_magic)));
                 result = viewModel.processor.process(source, rects, sharpen);
-            } catch (Exception e) {
+            } catch (Exception | OutOfMemoryError e) {
+                // OutOfMemoryError is an Error, not an Exception: leaving it
+                // uncaught killed the process (fatal crash in the field).
                 failure = e;
             }
 
             final Bitmap finalResult = result;
-            final Exception finalFailure = failure;
+            final Throwable finalFailure = failure;
             runOnUiThread(() -> {
                 if (isDestroyed() || isFinishing()) return;
                 loadingOverlay.setVisibility(View.GONE);
@@ -352,8 +354,11 @@ public class MainActivity extends AppCompatActivity {
                 if (finalFailure != null) {
                     int msgRes = (finalFailure instanceof FileNotFoundException)
                             ? R.string.error_model_missing
+                            : (finalFailure instanceof OutOfMemoryError)
+                            ? R.string.error_oom
                             : R.string.error_process_fail_ext;
-                    String errorMsg = (finalFailure instanceof FileNotFoundException)
+                    String errorMsg = (finalFailure instanceof FileNotFoundException
+                            || finalFailure instanceof OutOfMemoryError)
                             ? getString(msgRes)
                             : getString(msgRes, finalFailure.getMessage());
                     Toast.makeText(MainActivity.this, errorMsg, Toast.LENGTH_LONG).show();

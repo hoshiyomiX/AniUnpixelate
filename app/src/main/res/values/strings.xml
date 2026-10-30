@@ -17,6 +17,7 @@
     <string name="error_decode_image">Could not decode this image. It may be corrupted or in an unsupported format.</string>
     <string name="error_model_fail">Model load failed</string>
     <string name="error_model_missing">AI model file (model.onnx) is not bundled in this build. Add it to app/src/main/assets/ and rebuild the app first.</string>
+    <string name="error_oom">Not enough memory to run the restoration. Close other apps and try again.</string>
     <string name="msg_select_area">Please select an area first</string>
     <string name="status_loading_weights">Loading neural weights…</string>
     <string name="status_performing_magic">Performing unpixelation magic…</string>

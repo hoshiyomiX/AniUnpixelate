@@ -17,6 +17,7 @@
     <string name="error_decode_image">无法解码该图片，文件可能已损坏或格式不受支持。</string>
     <string name="error_model_fail">模型加载失败</string>
     <string name="error_model_missing">当前安装包未内置 AI 模型文件 (model.onnx)。请先将其放入 app/src/main/assets/ 并重新打包。</string>
+    <string name="error_oom">内存不足，无法执行修复。请关闭其他应用后重试。</string>
     <string name="msg_select_area">请先选择需要修复的区域</string>
     <string name="status_loading_weights">正在加载神经元权重…</string>
     <string name="status_performing_magic">正在施展 AI 修复魔法…</string>
