@@ -3,7 +3,9 @@ name: Build APK
 # Builds the Android APK on every push and pull request.
 # Debug APK  -> installable directly.
 # Release APK -> unsigned; sign it before distribution (see README).
-# Tag pushes (v*) additionally publish both APKs to a GitHub Release.
+# Every successful build is published to GitHub Releases:
+#   - branch pushes & manual runs -> rolling "nightly" pre-release (replaced on each build)
+#   - tag pushes (v*)             -> a Release named after the tag
 on:
   push:
     branches: [ main, master ]
@@ -15,6 +17,10 @@ jobs:
   build:
     name: Build debug & release APK
     runs-on: ubuntu-latest
+    # Required to create GitHub Releases and upload assets via gh.
+    # Without this, the default read-only GITHUB_TOKEN gets a 403 on release creation.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -67,14 +73,50 @@ jobs:
             app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Publish GitHub Release (tag pushes only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Stage APKs with versioned names
+        if: "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="${GITHUB_REF#refs/tags/}"
+          else
+            VER="${GITHUB_SHA::7}"
+          fi
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/*.apk   "dist/AniRestore-debug-${VER}.apk"
+          cp app/build/outputs/apk/release/*.apk "dist/AniRestore-release-unsigned-${VER}.apk"
+          echo "== staged release assets =="
+          ls -l dist
+
+      - name: Publish GitHub Release (tag pushes)
+        if: "startsWith(github.ref, 'refs/tags/')"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          gh release create "$TAG" --title "$TAG" --generate-notes || true
-          gh release upload "$TAG" \
-            app/build/outputs/apk/debug/*.apk \
-            app/build/outputs/apk/release/*.apk \
-            --clobber
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/*.apk --clobber
+          gh release view "$TAG" --json name,tagName,url
+
+      - name: Publish rolling nightly release (branch pushes & manual runs)
+        if: "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !startsWith(github.ref, 'refs/tags/')"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [ -f app/src/main/assets/model.onnx ]; then
+            MODEL_NOTE="ONNX model bundled — AI restoration active."
+          else
+            MODEL_NOTE="No model.onnx bundled — the app builds and installs, but AI restoration stays inactive until a model is added to app/src/main/assets/."
+          fi
+          # Replace the previous nightly so the tag always points at the newest commit.
+          gh release delete nightly --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create nightly \
+            --target "$GITHUB_SHA" \
+            --title "Nightly ${SHORT_SHA}" \
+            --notes "Automated build @ ${GITHUB_SHA} ($(date -u +'%Y-%m-%d %H:%M UTC')). ${MODEL_NOTE}" \
+            --prerelease \
+            dist/*.apk
+          gh release view nightly --json name,tagName,url,assets
