@@ -20,6 +20,8 @@
     <string name="error_oom">内存不足，无法执行修复。请关闭其他应用后重试。</string>
     <string name="msg_select_area">请先选择需要修复的区域</string>
     <string name="status_loading_weights">正在加载神经元权重…</string>
+    <string name="status_preparing_model">正在准备 AI 模型（仅首次运行）…</string>
+    <string name="status_tile_progress">正在修复 %1$d / %2$d…</string>
     <string name="status_performing_magic">正在施展 AI 修复魔法…</string>
     <string name="msg_save_success">保存成功！图像已存入相册</string>
     <string name="error_save_fail">保存失败：%s</string>

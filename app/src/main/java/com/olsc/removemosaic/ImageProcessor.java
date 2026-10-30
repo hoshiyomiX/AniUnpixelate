@@ -33,16 +33,30 @@ import ai.onnxruntime.OrtSession;
  * ImageProcessor runs the ONNX inference pipeline that restores the selected
  * region of an image.
  *
- * Pipeline: compute the bounding box of all selections (plus padding so the
- * network sees surrounding context) -> expand it to a SQUARE context window
- * (stretching a non-square crop to the model's square input used to distort the
- * geometry the model perceives and blur the result) -> progressively halve
- * the region down to the working resolution (single-step bilinear skips
- * source pixels when minifying more than ~2x and shimmers line art) -> run
- * inference -> extract exactly the crop's sub-rect from the model-resolution output
- * -> scale it back -> sharpen it (unsharp mask; the model regresses to the
- * mean so its output is systematically soft) -> alpha-blend it into the
- * original through a feathered selection mask.
+ * The model (big-lama ONNX export) has a fixed 1x3x512x512 input, so the
+ * pipeline works in one of two modes depending on the size of the selection:
+ *
+ * <ul>
+ * <li><b>Compact selections</b> (context window up to {@link #TILE_TRIGGER}
+ * source pixels): the bounding box of all selections plus padding is expanded
+ * to a square, resampled once onto the 512x512 model canvas (an upscale for
+ * tiny selections — harmless; at most a 1.25x downscale at the trigger point),
+ * a single inference runs, and the crop's sub-rect is scaled back, sharpened,
+ * and alpha-blended through a feathered selection mask.</li>
+ * <li><b>Large selections</b>: a single 512x512 pass would clamp the whole
+ * area to a hard 512-pixel ceiling and the upscaled result would read as
+ * blur (the on-device "worse blurry" reports). Instead the area is covered by
+ * a grid of overlapping 512x512 tiles sampled 1:1 from the ORIGINAL image, so
+ * the restoration resolves at native resolution. Tiles that do not touch the
+ * selection (plus the blend feather) are skipped; the remaining tiles are
+ * blended with smooth cosine weights so their seams cancel out.</li>
+ * </ul>
+ *
+ * Model loading never materializes the ~200 MB model as a Java byte[]: the
+ * asset is streamed once into filesDir and the ONNX session is created
+ * directly from that path. (Loading through a ByteArrayOutputStream proved
+ * fatal on devices with a 256 MB heap: its growth-by-doubling needs a
+ * 256 MB + 16 B array, which is larger than the entire heap.)
  */
 public class ImageProcessor {
 
@@ -62,17 +76,104 @@ public class ImageProcessor {
     private static final long MIN_FREE_FOR_EXTRACT = 220L * 1024 * 1024;
 
     /**
-     * Side of the intermediate square canvas the model input is composed on.
-     * Equal to the model resolution, so the compose step feeds the network
-     * 1:1 with no additional lossy resampling in between.
+     * Side of the intermediate square canvas the model input is composed on
+     * (single-pass mode). Equal to the model resolution, so the compose step
+     * feeds the network 1:1 with no additional lossy resampling in between.
      */
     private static final int WORK_SIZE = 512;
 
     /** Sharpening strength used when the caller does not specify one. */
     public static final float DEFAULT_SHARPEN = 0.6f;
 
+    // -----------------------------------------------------------------
+    // Tiled-mode constants (large selections).
+    // -----------------------------------------------------------------
+
+    /** Tile side; identical to the model input side so tiles feed the
+     *  network 1:1 at native image resolution. */
+    private static final int TILE_SIZE = 512;
+
+    /** Overlap between neighbouring tiles. Smooth cosine blending across the
+     *  overlap hides the seams; 128px (25%) also guarantees every restored
+     *  pixel is inferred with plenty of surrounding context. */
+    private static final int TILE_OVERLAP = 128;
+
+    /** Extra context around the selection bbox covered by the tile grid, so
+     *  hole pixels near the selection border never sit next to a tile edge. */
+    private static final int TILE_CONTEXT_MARGIN = 64;
+
+    /**
+     * Selections whose square context window exceeds this side are processed
+     * in tiled mode. Below it the single-pass resample loses at most ~1.25x
+     * linear resolution, which the sharpening pass fully compensates.
+     */
+    private static final int TILE_TRIGGER = 640;
+
+    /**
+     * Tiles whose window misses every selection by more than this margin are
+     * skipped. The blend feather is at most 6px; 8px covers it with slack, so
+     * a skipped tile can never be needed for a pixel the blend mask touches.
+     */
+    private static final int TILE_FEATHER_MARGIN = 8;
+
     private OrtSession session;
     private final OrtEnvironment env = OrtEnvironment.getEnvironment();
+
+    /** Per-axis tile blending weights, indexed by pixel offset inside the
+     *  tile: cosine ramp across the overlap zones at both ends, 1 in the
+     *  core. Shared by every tile. */
+    private static final float[] TILE_WEIGHT_1D = buildTileWeight1D();
+
+    private static float[] buildTileWeight1D() {
+        float[] w = new float[TILE_SIZE];
+        for (int rel = 0; rel < TILE_SIZE; rel++) {
+            w[rel] = tileAxisWeight(rel);
+        }
+        return w;
+    }
+
+    private static float tileAxisWeight(int rel) {
+        if (rel < 0 || rel >= TILE_SIZE) return 0f;
+        final int o = TILE_OVERLAP;
+        if (rel < o) {
+            return 0.5f * (1f - (float) Math.cos(Math.PI * rel / o));
+        }
+        if (rel > TILE_SIZE - o) {
+            return 0.5f * (1f - (float) Math.cos(Math.PI * (TILE_SIZE - rel) / o));
+        }
+        return 1f;
+    }
+
+    /** Callback for coarse progress reporting during long restorations. */
+    public interface ProgressListener {
+        /**
+         * Called after each model inference finishes (and once with
+         * {@code done == 0} before the first). {@code total} is the number of
+         * inference passes the current run will perform; 1 in single-pass
+         * mode. Invoked on the calling (worker) thread.
+         */
+        void onProgress(int done, int total);
+    }
+
+    // -----------------------------------------------------------------
+    // Model lifecycle
+    // -----------------------------------------------------------------
+
+    /** True when the model asset has already been extracted for the current
+     *  install, so the UI can tell a one-time first-run extraction from a
+     *  fast cached load. */
+    public static boolean isModelCached(Context context) {
+        final File dir = context.getFilesDir();
+        final File target = new File(dir, MODEL_ASSET);
+        final File stamp = new File(dir, MODEL_ASSET + ".stamp");
+        try {
+            return target.isFile() && target.length() > 0
+                    && stamp.isFile()
+                    && installStamp(context).equals(readStampFile(stamp));
+        } catch (IOException unreadableStamp) {
+            return false; // unreadable stamp == not cached -> will re-extract
+        }
+    }
 
     /**
      * Loads the ONNX model for inference.
@@ -230,18 +331,29 @@ public class ImageProcessor {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Restoration entry points
+    // -----------------------------------------------------------------
+
     /** Compatibility overload: restores with the default sharpening strength. */
     public Bitmap process(Bitmap origImage, List<RectF> rectangles) throws Exception {
-        return process(origImage, rectangles, DEFAULT_SHARPEN);
+        return process(origImage, rectangles, DEFAULT_SHARPEN, null);
+    }
+
+    /** Compatibility overload: restores with an explicit sharpening strength. */
+    public Bitmap process(Bitmap origImage, List<RectF> rectangles,
+                          float sharpenStrength) throws Exception {
+        return process(origImage, rectangles, sharpenStrength, null);
     }
 
     /**
      * Core restoration logic. {@code sharpenStrength} is a 0..1 user control
      * (0 = raw model output, 1 = maximum unsharp mask); values outside the
-     * range are clamped.
+     * range are clamped. {@code progress} is optional.
      */
     public synchronized Bitmap process(Bitmap origImage, List<RectF> rectangles,
-                                       float sharpenStrength) throws Exception {
+                                       float sharpenStrength,
+                                       ProgressListener progress) throws Exception {
         if (session == null) {
             throw new IllegalStateException("ONNX model not loaded");
         }
@@ -280,6 +392,26 @@ public class ImageProcessor {
         maxX = Math.min(width, maxX + CROP_PADDING);
         maxY = Math.min(height, maxY + CROP_PADDING);
 
+        final int cropW = maxX - minX;
+        final int cropH = maxY - minY;
+
+        if (Math.max(cropW, cropH) > TILE_TRIGGER) {
+            return processTiled(origImage, valid, minX, minY, maxX, maxY,
+                    strength, progress);
+        }
+        return processSinglePass(origImage, valid, minX, minY, maxX, maxY,
+                strength, progress);
+    }
+
+    // -----------------------------------------------------------------
+    // Single-pass mode (compact selections)
+    // -----------------------------------------------------------------
+
+    private Bitmap processSinglePass(Bitmap origImage, List<RectF> valid,
+                                     int minX, int minY, int maxX, int maxY,
+                                     float strength, ProgressListener progress) throws Exception {
+        final int width = origImage.getWidth();
+        final int height = origImage.getHeight();
         final int cropW = maxX - minX;
         final int cropH = maxY - minY;
 
@@ -355,14 +487,281 @@ public class ImageProcessor {
                 ? maskWork
                 : Bitmap.createScaledBitmap(maskWork, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, true);
 
-        // Prepare tensor data (NCHW float, values normalized to [0, 1]).
+        if (progress != null) progress.onProgress(0, 1);
+        final Bitmap outBitmap = runInference(modelImg, modelMask);
+        if (progress != null) progress.onProgress(1, 1);
+
+        // ------------------------------------------------------------------
+        // Cut the crop's sub-rect out of the model-resolution output. Because the
+        // square mapping is uniform, the sub-rect has the crop's aspect
+        // ratio — scaling it back to cropW x cropH involves no distortion.
+        // ------------------------------------------------------------------
+        int subX = Math.round((minX - sqX) * MODEL_INPUT_SIZE / (float) side);
+        int subY = Math.round((minY - sqY) * MODEL_INPUT_SIZE / (float) side);
+        int subW = Math.round(cropW * MODEL_INPUT_SIZE / (float) side);
+        int subH = Math.round(cropH * MODEL_INPUT_SIZE / (float) side);
+        subW = Math.max(1, Math.min(subW, MODEL_INPUT_SIZE));
+        subH = Math.max(1, Math.min(subH, MODEL_INPUT_SIZE));
+        // Derive the smaller dimension from the larger one so the sub-rect
+        // keeps the crop's aspect ratio; rounding both independently can
+        // compound up to several percent on extreme sliver selections.
+        if (cropW >= cropH) {
+            subH = Math.max(1, Math.min(MODEL_INPUT_SIZE,
+                    Math.round(subW * cropH / (float) cropW)));
+        } else {
+            subW = Math.max(1, Math.min(MODEL_INPUT_SIZE,
+                    Math.round(subH * cropW / (float) cropH)));
+        }
+        subX = Math.min(Math.max(0, subX), MODEL_INPUT_SIZE - subW);
+        subY = Math.min(Math.max(0, subY), MODEL_INPUT_SIZE - subH);
+
+        final Bitmap cropOut = Bitmap.createBitmap(outBitmap, subX, subY, subW, subH);
+        final Bitmap restored = Bitmap.createScaledBitmap(cropOut, cropW, cropH, true);
+
+        // ------------------------------------------------------------------
+        // Blend mask at crop resolution, feathered a few pixels so the seam
+        // between original and restored content is a smooth transition
+        // instead of a hard step that emphasizes the restored region.
+        // ------------------------------------------------------------------
+        final Paint whitePaint2 = new Paint();
+        whitePaint2.setColor(Color.WHITE);
+        whitePaint2.setStyle(Paint.Style.FILL);
+        whitePaint2.setAntiAlias(false);
+        final int[] maskPixels = buildFeatheredMask(valid, minX, minY, cropW, cropH, whitePaint2);
+
+        // ------------------------------------------------------------------
+        // Unsharp mask on the restored pixels, at the FINAL resolution so it
+        // puts back the acutance the model-resolution ceiling and the bilinear
+        // upscale took away. Runs channel-by-channel to keep the memory
+        // footprint at a single extra int[] regardless of crop size.
+        // ------------------------------------------------------------------
+        int[] outPixels = new int[cropW * cropH];
+        restored.getPixels(outPixels, 0, cropW, 0, 0, cropW, cropH);
+        if (strength > 0.01f) {
+            final float upscale = side / (float) MODEL_INPUT_SIZE;
+            final int radius = Math.max(1, Math.min(4, Math.round(upscale * 0.75f)));
+            unsharpMask(outPixels, cropW, cropH, 1.2f * strength, radius, 3);
+        }
+
+        // Recycle intermediates. createScaledBitmap()/createBitmap() may
+        // return the source object itself when no scaling/subsetting is
+        // needed, so identity is checked to avoid double-recycling.
+        inter.recycle();
+        squareWork.recycle();
+        maskWork.recycle();
+        if (modelImg != squareWork) modelImg.recycle();
+        if (modelMask != maskWork) modelMask.recycle();
+        if (cropOut != outBitmap) cropOut.recycle();
+        if (restored != cropOut) restored.recycle();
+        outBitmap.recycle();
+
+        return blendIntoOriginal(origImage, outPixels, maskPixels,
+                minX, minY, cropW, cropH);
+    }
+
+    // -----------------------------------------------------------------
+    // Tiled mode (large selections) — native-resolution restoration
+    // -----------------------------------------------------------------
+
+    private Bitmap processTiled(Bitmap origImage, List<RectF> valid,
+                                int minX, int minY, int maxX, int maxY,
+                                float strength, ProgressListener progress) throws Exception {
+        final int cropW = maxX - minX;
+        final int cropH = maxY - minY;
+
+        // Tile grid over the crop expanded by a context margin. Tiles at the
+        // grid border stick out past the image on edge selections; the CLAMP
+        // shader below edge-replicates those strips.
+        final int gx0 = minX - TILE_CONTEXT_MARGIN;
+        final int gy0 = minY - TILE_CONTEXT_MARGIN;
+        final int[] xs = tileStarts(gx0, (maxX + TILE_CONTEXT_MARGIN) - gx0);
+        final int[] ys = tileStarts(gy0, (maxY + TILE_CONTEXT_MARGIN) - gy0);
+
+        // Feathered blend mask first — it does not depend on the restored
+        // content, and the skip test below leans on the guarantee that only
+        // pixels under (selection + feather) ever take model output.
+        final Paint whitePaint = new Paint();
+        whitePaint.setColor(Color.WHITE);
+        whitePaint.setStyle(Paint.Style.FILL);
+        whitePaint.setAntiAlias(false);
+        final int[] maskPixels = buildFeatheredMask(valid, minX, minY, cropW, cropH, whitePaint);
+
+        // Only tiles whose window comes within the feather margin of a
+        // selection can contribute a pixel the blend mask touches; the rest
+        // would run a full inference for output that is blended away.
+        final List<int[]> runTiles = new ArrayList<>();
+        for (int ty : ys) {
+            for (int tx : xs) {
+                if (tileTouchesSelection(tx, ty, valid)) {
+                    runTiles.add(new int[]{tx, ty});
+                }
+            }
+        }
+        final int totalTiles = runTiles.size();
+        if (progress != null) progress.onProgress(0, totalTiles);
+
+        final int n = cropW * cropH;
+        final float[] accR = new float[n];
+        final float[] accG = new float[n];
+        final float[] accB = new float[n];
+        final float[] accW = new float[n];
+
+        final int[] tilePixels = new int[TILE_SIZE * TILE_SIZE];
+        final Paint shaderPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+        final Paint maskPaint = new Paint();
+        maskPaint.setColor(Color.WHITE);
+        maskPaint.setStyle(Paint.Style.FILL);
+        maskPaint.setAntiAlias(false);
+
+        Bitmap outTile = null;
+        try {
+            for (int t = 0; t < totalTiles; t++) {
+                final int tx = runTiles.get(t)[0];
+                final int ty = runTiles.get(t)[1];
+
+                // 1:1 tile of the original image, edge-replicated wherever
+                // the tile crosses the image border.
+                final Bitmap tileImg = Bitmap.createBitmap(TILE_SIZE, TILE_SIZE, Bitmap.Config.ARGB_8888);
+                final BitmapShader shader = new BitmapShader(origImage,
+                        Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+                final Matrix m = new Matrix();
+                m.setTranslate(-tx, -ty);
+                shader.setLocalMatrix(m);
+                shaderPaint.setShader(shader);
+                final Canvas imgCanvas = new Canvas(tileImg);
+                imgCanvas.drawRect(0, 0, TILE_SIZE, TILE_SIZE, shaderPaint);
+                shaderPaint.setShader(null);
+
+                // Binary hole mask for this tile (white = restore).
+                final Bitmap tileMask = Bitmap.createBitmap(TILE_SIZE, TILE_SIZE, Bitmap.Config.ARGB_8888);
+                final Canvas maskCanvas = new Canvas(tileMask);
+                maskCanvas.drawColor(Color.BLACK);
+                maskCanvas.save();
+                maskCanvas.translate(-tx, -ty);
+                for (RectF rect : valid) {
+                    maskCanvas.drawRect(rect, maskPaint);
+                }
+                maskCanvas.restore();
+
+                outTile = runInference(tileImg, tileMask);
+                tileImg.recycle();
+                tileMask.recycle();
+
+                // Accumulate the tile's output into the crop buffers with
+                // its blending weights. Rows/columns outside the crop cannot
+                // receive output and are skipped wholesale.
+                outTile.getPixels(tilePixels, 0, TILE_SIZE, 0, 0, TILE_SIZE, TILE_SIZE);
+                final int py0 = Math.max(ty, minY);
+                final int py1 = Math.min(ty + TILE_SIZE, maxY);
+                final int px0 = Math.max(tx, minX);
+                final int px1 = Math.min(tx + TILE_SIZE, maxX);
+                for (int py = py0; py < py1; py++) {
+                    final float wy = TILE_WEIGHT_1D[py - ty];
+                    if (wy <= 0f) continue;
+                    final int rowBase = (py - minY) * cropW;
+                    for (int px = px0; px < px1; px++) {
+                        final float w = wy * TILE_WEIGHT_1D[px - tx];
+                        if (w <= 0f) continue;
+                        final int i = rowBase + (px - minX);
+                        final int c = tilePixels[(py - ty) * TILE_SIZE + (px - tx)];
+                        accR[i] += w * Color.red(c);
+                        accG[i] += w * Color.green(c);
+                        accB[i] += w * Color.blue(c);
+                        accW[i] += w;
+                    }
+                }
+                outTile.recycle();
+                outTile = null;
+                if (progress != null) progress.onProgress(t + 1, totalTiles);
+            }
+        } finally {
+            if (outTile != null) outTile.recycle();
+        }
+
+        // Normalize the weighted sums into restored pixels. Pixels no tile
+        // covered (cannot happen for selection pixels — the grid provably
+        // covers the whole crop — but be defensive) keep the original.
+        int[] outPixels = new int[n];
+        int[] cropOrigPixels = new int[n];
+        origImage.getPixels(cropOrigPixels, 0, cropW, minX, minY, cropW, cropH);
+        for (int i = 0; i < n; i++) {
+            final float w = accW[i];
+            if (w > 1e-3f) {
+                int r = clamp255(Math.round(accR[i] / w));
+                int g = clamp255(Math.round(accG[i] / w));
+                int b = clamp255(Math.round(accB[i] / w));
+                outPixels[i] = Color.argb(255, r, g, b);
+            } else {
+                outPixels[i] = cropOrigPixels[i];
+            }
+        }
+
+        // Unsharp mask at native resolution: radius 1 is the right scale —
+        // there is no upscale to compensate for, only the model's natural
+        // softness.
+        if (strength > 0.01f) {
+            unsharpMask(outPixels, cropW, cropH, 1.2f * strength, 1, 3);
+        }
+
+        return blendIntoOriginal(origImage, outPixels, maskPixels,
+                minX, minY, cropW, cropH);
+    }
+
+    /**
+     * Start coordinates of TILE_SIZE-wide tiles covering [start,
+     * start+span): the first tile starts at {@code start}, the last ends
+     * exactly at {@code start+span}, and everything in between is spaced
+     * uniformly with at least {@link #TILE_OVERLAP} of overlap (exactly
+     * uniform when the span is a multiple of the stride).
+     */
+    private static int[] tileStarts(int start, int span) {
+        if (span <= TILE_SIZE) {
+            return new int[]{start};
+        }
+        final int stride = TILE_SIZE - TILE_OVERLAP;
+        final int n = (int) Math.ceil((span - TILE_SIZE) / (double) stride) + 1;
+        final int[] starts = new int[n];
+        final double step = (span - TILE_SIZE) / (double) (n - 1);
+        for (int i = 0; i < n; i++) {
+            starts[i] = start + (int) Math.round(step * i);
+        }
+        return starts;
+    }
+
+    /** True when the tile's window comes within {@link #TILE_FEATHER_MARGIN}
+     *  of any selection, i.e. the tile can feed pixels the feathered blend
+     *  mask might touch. */
+    private static boolean tileTouchesSelection(int tx, int ty, List<RectF> valid) {
+        final float l = tx - TILE_FEATHER_MARGIN;
+        final float t = ty - TILE_FEATHER_MARGIN;
+        final float r = tx + TILE_SIZE + TILE_FEATHER_MARGIN;
+        final float b = ty + TILE_SIZE + TILE_FEATHER_MARGIN;
+        for (RectF rect : valid) {
+            if (rect.right > l && rect.left < r && rect.bottom > t && rect.top < b) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -----------------------------------------------------------------
+    // Shared helpers
+    // -----------------------------------------------------------------
+
+    /**
+     * Runs one 512x512 inference: packs the (already model-sized) image and
+     * binary mask into NCHW float tensors, executes the session, and unpacks
+     * the 255-scale output back into a bitmap. Non-finite outputs fall back
+     * to the input pixel.
+     */
+    private Bitmap runInference(Bitmap image, Bitmap mask) throws OrtException {
         final int pixelCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
         FloatBuffer imgBuffer = FloatBuffer.allocate(3 * pixelCount);
         FloatBuffer maskBuffer = FloatBuffer.allocate(pixelCount);
         int[] pixelsImg = new int[pixelCount];
         int[] pixelsMask = new int[pixelCount];
-        modelImg.getPixels(pixelsImg, 0, MODEL_INPUT_SIZE, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-        modelMask.getPixels(pixelsMask, 0, MODEL_INPUT_SIZE, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+        image.getPixels(pixelsImg, 0, MODEL_INPUT_SIZE, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+        mask.getPixels(pixelsMask, 0, MODEL_INPUT_SIZE, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
 
         for (int c = 0; c < 3; c++) {
             for (int i = 0; i < pixelCount; i++) {
@@ -378,10 +777,6 @@ public class ImageProcessor {
             maskBuffer.put(i, Color.red(pixelsMask[i]) / 255.0f > 0.5f ? 1.0f : 0.0f);
         }
 
-        // Run inference. Tensors and the result are AutoCloseable; the
-        // try-with-resources block guarantees they are freed even if the
-        // session throws mid-flight.
-        Bitmap outBitmap;
         try (OnnxTensor tImage = OnnxTensor.createTensor(env, imgBuffer,
                 new long[]{1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE});
              OnnxTensor tMask = OnnxTensor.createTensor(env, maskBuffer,
@@ -416,43 +811,23 @@ public class ImageProcessor {
                     outPixels[i] = Color.argb(255, r, g, b);
                 }
 
-                outBitmap = Bitmap.createBitmap(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, Bitmap.Config.ARGB_8888);
-                outBitmap.setPixels(outPixels, 0, MODEL_INPUT_SIZE, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+                Bitmap outBitmap = Bitmap.createBitmap(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
+                        Bitmap.Config.ARGB_8888);
+                outBitmap.setPixels(outPixels, 0, MODEL_INPUT_SIZE, 0, 0,
+                        MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+                return outBitmap;
             }
         }
+    }
 
-        // ------------------------------------------------------------------
-        // Cut the crop's sub-rect out of the model-resolution output. Because the
-        // square mapping is uniform, the sub-rect has the crop's aspect
-        // ratio — scaling it back to cropW x cropH involves no distortion.
-        // ------------------------------------------------------------------
-        int subX = Math.round((minX - sqX) * MODEL_INPUT_SIZE / (float) side);
-        int subY = Math.round((minY - sqY) * MODEL_INPUT_SIZE / (float) side);
-        int subW = Math.round(cropW * MODEL_INPUT_SIZE / (float) side);
-        int subH = Math.round(cropH * MODEL_INPUT_SIZE / (float) side);
-        subW = Math.max(1, Math.min(subW, MODEL_INPUT_SIZE));
-        subH = Math.max(1, Math.min(subH, MODEL_INPUT_SIZE));
-        // Derive the smaller dimension from the larger one so the sub-rect
-        // keeps the crop's aspect ratio; rounding both independently can
-        // compound up to several percent on extreme sliver selections.
-        if (cropW >= cropH) {
-            subH = Math.max(1, Math.min(MODEL_INPUT_SIZE,
-                    Math.round(subW * cropH / (float) cropW)));
-        } else {
-            subW = Math.max(1, Math.min(MODEL_INPUT_SIZE,
-                    Math.round(subH * cropW / (float) cropH)));
-        }
-        subX = Math.min(Math.max(0, subX), MODEL_INPUT_SIZE - subW);
-        subY = Math.min(Math.max(0, subY), MODEL_INPUT_SIZE - subH);
-
-        final Bitmap cropOut = Bitmap.createBitmap(outBitmap, subX, subY, subW, subH);
-        final Bitmap restored = Bitmap.createScaledBitmap(cropOut, cropW, cropH, true);
-
-        // ------------------------------------------------------------------
-        // Blend mask at crop resolution, feathered a few pixels so the seam
-        // between original and restored content is a smooth transition
-        // instead of a hard step that emphasizes the restored region.
-        // ------------------------------------------------------------------
+    /**
+     * Builds the feathered per-pixel blend mask for the crop: white over the
+     * selections, black outside, smoothed by a couple of box-blur rounds over
+     * a few pixels so the seam between original and restored content is a
+     * gradient instead of a hard step.
+     */
+    private static int[] buildFeatheredMask(List<RectF> valid, int minX, int minY,
+                                            int cropW, int cropH, Paint whitePaint) {
         final Bitmap blendMask = Bitmap.createBitmap(cropW, cropH, Bitmap.Config.ARGB_8888);
         final Canvas blendCanvas = new Canvas(blendMask);
         blendCanvas.drawColor(Color.BLACK);
@@ -462,28 +837,21 @@ public class ImageProcessor {
         }
         int[] maskPixels = new int[cropW * cropH];
         blendMask.getPixels(maskPixels, 0, cropW, 0, 0, cropW, cropH);
-        final int feather = Math.max(1, Math.min(6, Math.round(side * 0.006f)));
+        blendMask.recycle();
+        final int feather = Math.max(1, Math.min(6, Math.round(Math.max(cropW, cropH) * 0.006f)));
         for (int i = 0; i < 2; i++) {
             boxBlurH(maskPixels, cropW, cropH, feather);
             boxBlurV(maskPixels, cropW, cropH, feather);
         }
+        return maskPixels;
+    }
 
-        // ------------------------------------------------------------------
-        // Unsharp mask on the restored pixels, at the FINAL resolution so it
-        // puts back the acutance the model-resolution ceiling and the bilinear
-        // upscale took away. Runs channel-by-channel to keep the memory
-        // footprint at a single extra int[] regardless of crop size.
-        // ------------------------------------------------------------------
-        int[] outPixels = new int[cropW * cropH];
-        restored.getPixels(outPixels, 0, cropW, 0, 0, cropW, cropH);
-        if (strength > 0.01f) {
-            final float upscale = side / (float) MODEL_INPUT_SIZE;
-            final int radius = Math.max(1, Math.min(4, Math.round(upscale * 0.75f)));
-            unsharpMask(outPixels, cropW, cropH, 1.2f * strength, radius, 3);
-        }
-
-        // Seamless alpha blend: linearly mix original and restored pixels
-        // according to the (feathered) mask value of each pixel.
+    /**
+     * Alpha-blends the restored crop pixels into a copy of the original
+     * through the feathered mask and returns the full-size result.
+     */
+    private static Bitmap blendIntoOriginal(Bitmap origImage, int[] outPixels, int[] maskPixels,
+                                            int minX, int minY, int cropW, int cropH) {
         int[] cropOrigPixels = new int[cropW * cropH];
         origImage.getPixels(cropOrigPixels, 0, cropW, minX, minY, cropW, cropH);
 
@@ -501,21 +869,11 @@ public class ImageProcessor {
 
         Bitmap finalResult = origImage.copy(Bitmap.Config.ARGB_8888, true);
         finalResult.setPixels(cropOrigPixels, 0, cropW, minX, minY, cropW, cropH);
-
-        // Recycle intermediates. createScaledBitmap()/createBitmap() may
-        // return the source object itself when no scaling/subsetting is
-        // needed, so identity is checked to avoid double-recycling.
-        inter.recycle();
-        squareWork.recycle();
-        maskWork.recycle();
-        if (modelImg != squareWork) modelImg.recycle();
-        if (modelMask != maskWork) modelMask.recycle();
-        blendMask.recycle();
-        if (cropOut != outBitmap) cropOut.recycle();
-        if (restored != cropOut) restored.recycle();
-        outBitmap.recycle();
-
         return finalResult;
+    }
+
+    private static int clamp255(int v) {
+        return v < 0 ? 0 : (v > 255 ? 255 : v);
     }
 
     /**

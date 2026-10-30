@@ -15,6 +15,8 @@
 - **Offline ONNX Inference**: Integrated with ONNX Runtime, all AI computations are performed locally on the device—no cloud uploads, ensuring maximum privacy.
 - **Customizable Repair Area**: Allows users to manually select or brush over specific areas for precise local restoration.
 - **Seamless Blending**: Employs Alpha blending technology to ensure naturally smooth transitions between AI-generated content and the original background.
+- **Native-resolution tiling for large selections**: when the selection's context window exceeds 640px, the app switches to overlapping 512×512 tiles blended with cosine weights, inferring at the ORIGINAL image resolution instead of clamping everything to a single 512px pass (which made large selections come back soft/blurry). Compact selections keep the single-pass path. A per-tile progress indicator is shown while running.
+- **Friendly to low-memory devices**: the ~200 MB model is extracted once into a cache file and the ONNX session is created from that file path — no giant Java byte arrays (which OOM-crashed the app during load on devices with a 256 MB heap). Combined with `largeHeap`, load-time crashes are gone; genuine memory exhaustion now degrades to a readable error toast instead of a hard crash.
 
 ## 🚀 Getting Started
 

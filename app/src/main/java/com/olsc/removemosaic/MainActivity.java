@@ -330,17 +330,34 @@ public class MainActivity extends AppCompatActivity {
             Bitmap result = null;
             Throwable failure = null;
             try {
+                // The first launch after install must extract the ~200 MB
+                // model asset into the cache once; show a dedicated status
+                // for that instead of a generic "loading weights".
                 runOnUiThread(() ->
-                        txtLoadingStatus.setText(getString(R.string.status_loading_weights)));
-                viewModel.processor.loadModel(this);
+                        txtLoadingStatus.setText(getString(ImageProcessor.isModelCached(MainActivity.this)
+                                ? R.string.status_loading_weights
+                                : R.string.status_preparing_model)));
+                viewModel.processor.loadModel(MainActivity.this);
 
                 runOnUiThread(() ->
                         txtLoadingStatus.setText(getString(R.string.status_performing_magic)));
-                result = viewModel.processor.process(source, rects, sharpen);
-            } catch (Exception | OutOfMemoryError e) {
-                // OutOfMemoryError is an Error, not an Exception: leaving it
-                // uncaught killed the process (fatal crash in the field).
-                failure = e;
+                result = viewModel.processor.process(source, rects, sharpen,
+                        (done, total) -> {
+                            // Large selections run several inference passes;
+                            // report which one just finished.
+                            if (total > 1) {
+                                runOnUiThread(() -> txtLoadingStatus.setText(
+                                        getString(R.string.status_tile_progress, done, total)));
+                            }
+                        });
+            } catch (Throwable t) {
+                // Errors (including OutOfMemoryError — an Error, not an
+                // Exception — on very constrained devices) degrade to a
+                // readable toast instead of a hard process crash. Logged so
+                // field reports carry the stack trace; the type is preserved
+                // for the localized message routing below.
+                android.util.Log.e("AniRestore", "Restoration failed", t);
+                failure = t;
             }
 
             final Bitmap finalResult = result;

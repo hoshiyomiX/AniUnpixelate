@@ -20,6 +20,8 @@
     <string name="error_oom">Not enough memory to run the restoration. Close other apps and try again.</string>
     <string name="msg_select_area">Please select an area first</string>
     <string name="status_loading_weights">Loading neural weights…</string>
+    <string name="status_preparing_model">Preparing AI model (first run only)…</string>
+    <string name="status_tile_progress">Restoring %1$d / %2$d…</string>
     <string name="status_performing_magic">Performing unpixelation magic…</string>
     <string name="msg_save_success">Success! Image saved to Gallery</string>
     <string name="error_save_fail">Save failed: %s</string>

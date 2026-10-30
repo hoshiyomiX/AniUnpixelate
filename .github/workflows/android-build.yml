@@ -38,6 +38,10 @@ jobs:
       - name: Fetch ONNX model (Apache-2.0, big-lama)
         # The model is fetched at build time instead of living in git (208 MB
         # binary). Pinned URL + SHA256; swap the pin to upgrade the model.
+        # No app-side change is needed when swapping: the app extracts the
+        # asset into filesDir stamped with the package lastUpdateTime, so
+        # installing an updated APK always re-extracts and never serves a
+        # stale cached model.
         env:
           MODEL_URL: https://huggingface.co/gumka/lama-onnx/resolve/main/lama_fp32.onnx
           MODEL_SHA256: 1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6
