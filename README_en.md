@@ -37,7 +37,7 @@
 1. Fork or push this repository to your GitHub account.
 2. Open the **Actions** tab — the `Build APK` workflow runs automatically on every push / PR.
 3. When the run finishes, download `AniRestore-APK` from the run's **Artifacts** section (contains debug and unsigned release APKs).
-4. (Optional) Push a tag like `v1.0` and the workflow will automatically create a GitHub Release with the APKs attached.
+4. Every successful build is also published to the repo's **Releases** page: regular pushes refresh a rolling `nightly` pre-release (fully replaced on each build; the `nightly` tag always points at the newest commit), while pushing a tag like `v1.0` creates a proper Release named after the tag. Both carry the debug and unsigned release APKs (file names embed the commit / version).
 
 ### Option B: Local build
 
